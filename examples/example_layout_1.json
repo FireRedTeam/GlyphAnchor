@@ -1,0 +1,44 @@
+{
+  "prompt": "A photorealistic academic presentation scene in a modern lecture hall or conference room. A young researcher stands beside a large presentation screen and points toward the middle of the slide while giving a talk. The screen is the main focus, and the presenter stands on one side. Soft cinematic lighting, polished academic atmosphere, premium editorial photography style. The screen shows a clean, professional academic PPT slide with a light background, dark readable text, and subtle blue or red accents. Avoid clutter, cartoon elements, excessive diagrams, and messy layouts. The slide title at the top: \"GlyphAnchor: Enhancing Visual Text Rendering via Position-Anchored Glyph Priors\"\nBelow it, a section heading:\"Abstract:\"\nBelow that, a neat text block with:\"Rendering accurate text remains difficult for image generation and editing models, especially when the target contains long, complex, and densely arranged text or rare characters. Existing approaches either improve native text rendering through stronger backbones and data-centric training without explicit glyph priors, or incorporate glyph priors through specialized designs that remain insufficiently accurate and robust under challenging scenarios. We introduce GlyphAnchor, a novel text-rendering enhancement method for both text-to-image and image-editing diffusion transformer models. GlyphAnchor enhances the backbone with lightweight glyph patch conditions whose positions are anchored to the target image through the model's native positional encoding. We train this capability with staged supervised finetuning and further refine it with text-aware post-training to improve robustness. We also introduce InfoTextBench, a benchmark for evaluating text-rich visual text rendering in both generation and editing settings. Experiments across multiple backbones and benchmarks, including long, complex, and densely arranged text and rare character scenarios, show that GlyphAnchor consistently improves text fidelity while preserving overall image quality.\"\nThe title should be prominent, the abstract area should be centered and well-structured, and the overall slide should look like a carefully designed conference presentation. The presenter should wear professional academic attire and point to the middle of the slide. Photorealistic, minimal, sophisticated, sharp focus, visually impressive.",
+  "layout": [
+    {
+      "idx": 1,
+      "text": "GlyphAnchor: Enhancing Visual Text Rendering via Position-Anchored Glyph Priors",
+      "align": "left",
+      "valign": "top",
+      "bbox": [
+        0.0603,
+        0.1594,
+        0.7669,
+        0.0583
+      ]
+    },
+    {
+      "idx": 2,
+      "text": "Abstract:",
+      "align": "left",
+      "valign": "center",
+      "bbox": [
+        0.0649,
+        0.2315,
+        0.1,
+        0.04
+      ]
+    },
+    {
+      "idx": 3,
+      "text": "Rendering accurate text remains difficult for image generation and editing models, especially when the target contains long, complex, and densely arranged text or rare characters. Existing approaches either improve native text rendering through stronger backbones and data-centric training without explicit glyph priors, or incorporate glyph priors through specialized designs that remain insufficiently accurate and robust under challenging scenarios. We introduce GlyphAnchor, a novel text-rendering enhancement method for both text-to-image and image-editing diffusion transformer models. GlyphAnchor enhances the backbone with lightweight glyph patch conditions whose positions are anchored to the target image through the model's native positional encoding. We train this capability with staged supervised finetuning and further refine it with text-aware post-training to improve robustness. We also introduce InfoTextBench, a benchmark for evaluating text-rich visual text rendering in both generation and editing settings. Experiments across multiple backbones and benchmarks, including long, complex, and densely arranged text and rare character scenarios, show that GlyphAnchor consistently improves text fidelity while preserving overall image quality.",
+      "align": "left",
+      "valign": "top",
+      "bbox": [
+        0.058,
+        0.2829,
+        0.6742,
+        0.4897
+      ]
+    }
+  ],
+  "width": 1536,
+  "height": 1536,
+  "images": []
+}

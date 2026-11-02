@@ -6,15 +6,13 @@
 
 
 [![arXiv](https://img.shields.io/badge/arXiv-2609.02349-b31b1b.svg)](https://arxiv.org/abs/2609.02349)
-[![OpenReview](https://img.shields.io/badge/OpenReview-NeurIPS%202026-6842a6.svg)](https://openreview.net/forum?id=c3aMyawBN4)
+[![Hugging Face](https://img.shields.io/badge/🤗%20Hugging%20Face-Models-yellow)](https://huggingface.co/innerway/GlyphAnchor)
 
 Qiang Xiang<sup>1,2</sup>, Shuang Sun<sup>2</sup>, Binglei Li<sup>1,3</sup>, Yibo Chen<sup>2</sup>, Xu Tang<sup>2</sup>, Yao Hu<sup>2</sup>, Junping Zhang<sup>1,*</sup>
 
 <sup>1</sup>Fudan University &nbsp; <sup>2</sup>Xiaohongshu Inc. &nbsp; <sup>3</sup>Shanghai Innovation Institute
 
 <sup>*</sup>Corresponding author
-
-**🚧 Code coming soon. Stay tuned!**
 
 </div>
 
@@ -39,6 +37,164 @@ GlyphAnchor encodes rendered glyph patches into visual tokens and anchors their 
 - **Position-anchored glyph priors:** compact glyph patches provide character-shape and spatial guidance without changing the attention pattern.
 - **Staged supervised fine-tuning:** training gradually shifts from ground-truth image crops to rendered glyph patches, bridging the gap between training and inference.
 - **Text-aware post-training:** DiffusionNFT combines text-layout consistency, style, and visual fusion rewards to improve robustness and visual quality.
+
+## Quick Start
+
+### 1. Installation
+
+Create a Python 3.12 environment with Conda:
+
+```bash
+conda create -n glyphanchor python=3.12 -y
+conda activate glyphanchor
+```
+
+Install PyTorch and torchvision. The following command uses PyTorch 2.13.0 with CUDA 13.0; for other
+CUDA builds, follow the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
+
+```bash
+python3 -m pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu130
+```
+
+Clone the repository and install the remaining dependencies:
+
+```bash
+git clone https://github.com/FireRedTeam/GlyphAnchor.git
+cd GlyphAnchor
+pip install -r requirements.txt
+```
+
+### 2. Prepare the Models
+
+| Model | Task | Checkpoint |
+| :--- | :---: | :---: |
+| **GlyphAnchor-Z-Image** | Text-to-Image | [![Hugging Face](https://img.shields.io/badge/🤗%20Hugging%20Face-Weights-yellow)](https://huggingface.co/innerway/GlyphAnchor/tree/main/GlyphAnchor-Z-Image) |
+| **GlyphAnchor-FireRed-Image-Edit-1.1** | Image Editing | [![Hugging Face](https://img.shields.io/badge/🤗%20Hugging%20Face-Weights-yellow)](https://huggingface.co/innerway/GlyphAnchor/tree/main/GlyphAnchor-FireRed-Image-Edit-1.1) |
+| **GlyphAnchor-Qwen-Image-Edit-2511** | Image Editing | [![Hugging Face](https://img.shields.io/badge/🤗%20Hugging%20Face-Weights-yellow)](https://huggingface.co/innerway/GlyphAnchor/tree/main/GlyphAnchor-Qwen-Image-Edit-2511) |
+
+
+### 3. Run Inference
+
+**Option A: Generate with a predefined layout**
+
+**GlyphAnchor-Z-Image**:
+
+```bash
+python3 inference.py \
+  --model-type zimage \
+  --layout examples/example_layout_1.json \
+  --output outputs/example_1.png
+```
+
+**GlyphAnchor-FireRed-Image-Edit-1.1**:
+
+```bash
+python3 inference.py \
+  --model-type firered \
+  --layout examples/example_layout_1.json \
+  --output outputs/example_1.png
+```
+
+**GlyphAnchor-Qwen-Image-Edit-2511**:
+
+```bash
+python3 inference.py \
+  --model-type qwen \
+  --layout examples/example_layout_1.json \
+  --output outputs/example_1.png
+```
+
+See [example_layout_1.json](examples/example_layout_1.json) for the JSON format.
+Bounding boxes use normalized `[left, top, width, height]` coordinates.
+Reference image paths are relative to the JSON file.
+
+**Option B: Generate with VLM-planned layouts**
+
+Set your VLM API key, service URL, and model to generate layouts automatically.
+
+```bash
+export VLM_API_KEY="<API_KEY>"
+```
+
+**GlyphAnchor-Z-Image**:
+
+```bash
+python3 inference.py \
+  --model-type zimage \
+  --prompt examples/example_layout_2.txt \
+  --width 1152 --height 2048 \
+  --vlm-url "<API_BASE_URL>" \
+  --vlm-model "<MODEL_NAME>" \
+  --output outputs/vlm_layout_example_2.png
+```
+
+**GlyphAnchor-FireRed-Image-Edit-1.1**:
+
+```bash
+python3 inference.py \
+  --model-type firered \
+  --prompt examples/example_layout_3.txt \
+  --image examples/example_3_refimg_1.png \
+  --width 1152 --height 2048 \
+  --vlm-url "<API_BASE_URL>" \
+  --vlm-model "<MODEL_NAME>" \
+  --output outputs/vlm_layout_example_3.png
+```
+
+**GlyphAnchor-Qwen-Image-Edit-2511**:
+
+```bash
+python3 inference.py \
+  --model-type qwen \
+  --prompt examples/example_layout_3.txt \
+  --image examples/example_3_refimg_1.png \
+  --width 1152 --height 2048 \
+  --vlm-url "<API_BASE_URL>" \
+  --vlm-model "<MODEL_NAME>" \
+  --output outputs/vlm_layout_example_3.png
+```
+
+**Optional: Rewrite the prompt before layout planning**
+
+**Guess:** Turn a brief idea into a prompt with explicit text to render in the image.
+
+```bash
+python3 inference.py \
+  --model-type zimage \
+  --prompt 'Create a cafe poster with a catchy title and a short slogan.' \
+  --rewrite guess \
+  --vlm-url "<API_BASE_URL>" \
+  --vlm-model "<MODEL_NAME>" \
+  --output outputs/rewrite_guess.png
+```
+
+**Enrich:** Expand the prompt with visual details while keeping the specified text unchanged.
+
+```bash
+python3 inference.py \
+  --model-type zimage \
+  --prompt 'Create a cafe poster titled "Morning Brew" with the slogan "A fresh start in every cup".' \
+  --rewrite enrich \
+  --vlm-url "<API_BASE_URL>" \
+  --vlm-model "<MODEL_NAME>" \
+  --output outputs/rewrite_enrich.png
+```
+
+Adapt the VLM API configuration according to your API provider's documentation.
+
+### 4. Gradio Demo
+
+```bash
+export VLM_API_KEY="<API_KEY>"
+python3 app.py \
+  --vlm-backend openai \
+  --vlm-url "<API_BASE_URL>" \
+  --vlm-model "<MODEL_NAME>"
+```
+
+Open `http://127.0.0.1:7860`, choose a model, and load an example or enter a prompt.
+Use **Plan Layout**, edit the text boxes, then click **Generate**.
+**Save Layout** exports a JSON file for CLI inference on the same machine.
 
 ## Results
 
@@ -87,7 +243,7 @@ Character-rendering scores on 3,500 Level-1 common characters, 3,000 Level-2 cha
 
 ## TODO
 
-- [ ] Release the code.
+- [x] Release the code.
 - [ ] Release InfoTextBench.
 
 ## Citation

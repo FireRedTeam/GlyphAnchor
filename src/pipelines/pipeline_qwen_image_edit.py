@@ -1,0 +1,1663 @@
+# Copyright 2025 Qwen-Image Team and The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Modified for GlyphAnchor
+
+import inspect
+import math
+import re
+from functools import lru_cache
+from typing import Any, Callable, Dict, List, Optional, Union, Tuple
+from PIL import Image, ImageDraw, ImageFont
+
+import numpy as np
+import torch
+from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
+
+from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
+from diffusers.loaders import QwenImageLoraLoaderMixin
+from diffusers.models import AutoencoderKLQwenImage
+from ..models.transformer_qwenimage import QwenImageTransformer2DModel
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from diffusers.utils import is_torch_xla_available, logging, replace_example_docstring
+from diffusers.utils.torch_utils import randn_tensor
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.pipelines.qwenimage.pipeline_output import QwenImagePipelineOutput
+
+import ast
+import json
+from pathlib import Path
+
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
+
+
+from .layout_utils import (
+    _bbox_iou_xywh_norm,
+    _bbox_norm_xywh_to_xyxy_px,
+    _boxes_intersect,
+    _sort_matches_reading_order,
+    _xyxy_px_to_bbox_norm,
+    bbox_norm_xywh_to_pixel_wh,
+    dedup_layout_matches,
+    load_glyph_layout_items,
+    merge_layout_matches_to_blocks,
+    parse_layout_bbox,
+)
+from .glyph_utils import (
+    anchor_glyph_patches,
+    GLYPH_BG,
+    GLYPH_FG,
+    GLYPH_FONT_PATH,
+    GLYPH_FONT_SIZE,
+    GLYPH_IMAGE_HEIGHT,
+    GLYPH_PAD_X,
+    _break_at_word_boundary,
+    _fit_layout_font,
+    _get_text_bbox,
+    _layout_get_line_height,
+    _layout_get_render_lines,
+    _measure_layout_lines,
+    _measure_text,
+    _measure_text_width,
+    _rewrap_lines_by_width,
+    _simulate_tight_bbox,
+    _wrap_line_by_width,
+    _wrap_text_by_width,
+    ceil_to,
+    compose_glyph_group_image,
+    ensure_side,
+    get_font,
+    render_full_glyph_canvas as _render_full_glyph_canvas,
+    render_glyph_image,
+    render_one_glyph_patch,
+    round_to,
+)
+from .scheduler_utils import (
+    calculate_shift,
+    retrieve_timesteps,
+)
+
+
+logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+EXAMPLE_DOC_STRING = """
+    Examples:
+        ```py
+        >>> import torch
+        >>> from PIL import Image
+        >>> from diffusers import QwenImageEditPlusPipeline
+        >>> from diffusers.utils import load_image
+
+        >>> pipe = QwenImageEditPlusPipeline.from_pretrained("Qwen/Qwen-Image-Edit-2509", torch_dtype=torch.bfloat16)
+        >>> pipe.to("cuda")
+        >>> image = load_image(
+        ...     "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/yarn-art-pikachu.png"
+        ... ).convert("RGB")
+        >>> prompt = (
+        ...     "Make Pikachu hold a sign that says 'Qwen Edit is awesome', yarn art style, detailed, vibrant colors"
+        ... )
+        >>> # Depending on the variant being used, the pipeline call will slightly vary.
+        >>> # Refer to the pipeline documentation for more details.
+        >>> image = pipe(image, prompt, num_inference_steps=50).images[0]
+        >>> image.save("qwenimage_edit_plus.png")
+        ```
+"""
+
+CONDITION_IMAGE_SIZE = 384 * 384
+VAE_IMAGE_SIZE = 1536 * 1536
+# VAE_IMAGE_SIZE = 1024 * 1024
+
+
+# Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.calculate_shift
+
+
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
+
+
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
+def retrieve_latents(
+    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
+):
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+        return encoder_output.latent_dist.sample(generator)
+    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+        return encoder_output.latent_dist.mode()
+    elif hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    else:
+        raise AttributeError("Could not access latents of provided encoder_output")
+
+
+def calculate_dimensions(target_area, ratio):
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+
+    return width, height
+
+
+# ----------------------------
+# built-in ref text render
+# ----------------------------
+import math
+from functools import lru_cache
+from PIL import Image, ImageDraw, ImageFont
+
+
+def _fit_single_line_font(
+    text: str,
+    target_w: int,
+    target_h: int,
+    font_path: str,
+    pad_x: int = 0,
+    pad_y: int = 0,
+):
+    avail_w = max(1, int(target_w) - pad_x * 2)
+    avail_h = max(1, int(target_h) - pad_y * 2)
+
+    lo = 1
+    hi = max(1, avail_h * 4)
+    best = get_font(font_path, 1)
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        font = get_font(font_path, mid)
+        w, h, _, _ = _measure_text(font, text)
+
+        if w <= avail_w and h <= avail_h:
+            best = font
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return best
+
+def _fit_multiline_font(text: str, target_w: int, target_h: int, font_path: str, line_spacing: float = 0.15):
+    lines = text.splitlines() if "\n" in text else [text]
+    dummy = ImageDraw.Draw(Image.new("RGB", (8, 8), "white"))
+
+    lo, hi = 1, max(1, target_h * 4)
+    best = get_font(font_path, 1)
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        font = get_font(font_path, mid)
+
+        line_h = _layout_get_line_height(dummy, font)
+        total_h = int(len(lines) * line_h + max(0, len(lines) - 1) * line_h * line_spacing)
+
+        max_line_w = 0
+        for line in lines:
+            x0, y0, x1, y1 = dummy.textbbox((0, 0), line, font=font)
+            max_line_w = max(max_line_w, x1 - x0)
+
+        if max_line_w <= target_w and total_h <= target_h:
+            best = font
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return best
+
+
+def adjust_matches_by_real_glyph_overlap_2d(
+    matches,
+    glyph_images,
+    canvas_size,
+    gap_px=2,
+    row_thresh=0.6,
+    col_thresh=0.6,
+    max_iter=8,
+):
+    W, H = canvas_size
+
+    out = []
+    items = []
+
+    for m, g in zip(matches, glyph_images):
+        mm = dict(m)
+        mm["bbox_norm_xywh"] = list(m["bbox_norm_xywh"])
+        out.append(mm)
+
+        x, y, w, h = mm["bbox_norm_xywh"]
+        bw = w * W
+        bh = h * H
+
+        if not isinstance(g, Image.Image):
+            g = Image.fromarray(g)
+        gw, gh = g.size
+
+        cx = x * W + bw / 2
+        cy = y * H + bh / 2
+
+        items.append(
+            {
+                "w_norm": w,
+                "h_norm": h,
+                "bw": bw,
+                "bh": bh,
+                "gw": gw,
+                "gh": gh,
+                "base_cx": cx,
+                "base_cy": cy,
+                "shift_x": 0.0,
+                "shift_y": 0.0,
+            }
+        )
+
+    def rect(it):
+        cx = it["base_cx"] + it["shift_x"]
+        cy = it["base_cy"] + it["shift_y"]
+        return {
+            "left": cx - it["gw"] / 2,
+            "top": cy - it["gh"] / 2,
+            "right": cx + it["gw"] / 2,
+            "bottom": cy + it["gh"] / 2,
+            "cx": cx,
+            "cy": cy,
+        }
+
+    def overlap_1d(a1, a2, b1, b2):
+        return min(a2, b2) - max(a1, b1)
+
+    def move_pair_x(i, j, need):
+        ri = rect(items[i])
+        rj = rect(items[j])
+
+        if ri["cx"] <= rj["cx"]:
+            li, ri_idx = i, j
+        else:
+            li, ri_idx = j, i
+
+        rl = rect(items[li])
+        rr = rect(items[ri_idx])
+
+        cap_l = max(0.0, rl["left"])
+        cap_r = max(0.0, W - rr["right"])
+
+        take_l = min(need / 2, cap_l)
+        take_r = min(need / 2, cap_r)
+
+        remain = need - take_l - take_r
+
+        extra_r = min(remain, cap_r - take_r)
+        take_r += extra_r
+        remain -= extra_r
+
+        extra_l = min(remain, cap_l - take_l)
+        take_l += extra_l
+        remain -= extra_l
+
+        items[li]["shift_x"] -= take_l
+        items[ri_idx]["shift_x"] += take_r
+
+        return take_l + take_r
+
+    def move_pair_y(i, j, need):
+        ri = rect(items[i])
+        rj = rect(items[j])
+
+        if ri["cy"] <= rj["cy"]:
+            ui, di = i, j
+        else:
+            ui, di = j, i
+
+        ru = rect(items[ui])
+        rd = rect(items[di])
+
+        cap_u = max(0.0, ru["top"])
+        cap_d = max(0.0, H - rd["bottom"])
+
+        take_u = min(need / 2, cap_u)
+        take_d = min(need / 2, cap_d)
+
+        remain = need - take_u - take_d
+
+        extra_d = min(remain, cap_d - take_d)
+        take_d += extra_d
+        remain -= extra_d
+
+        extra_u = min(remain, cap_u - take_u)
+        take_u += extra_u
+        remain -= extra_u
+
+        items[ui]["shift_y"] -= take_u
+        items[di]["shift_y"] += take_d
+
+        return take_u + take_d
+
+    order = sorted(
+        range(len(items)),
+        key=lambda i: (items[i]["base_cy"], items[i]["base_cx"]),
+    )
+
+    for _ in range(max_iter):
+        changed = False
+
+        for a in range(len(order)):
+            for b in range(a + 1, len(order)):
+                i = order[a]
+                j = order[b]
+
+                ri = rect(items[i])
+                rj = rect(items[j])
+
+                ox = overlap_1d(ri["left"], ri["right"], rj["left"], rj["right"])
+                oy = overlap_1d(ri["top"], ri["bottom"], rj["top"], rj["bottom"])
+
+                if ox <= 0 or oy <= 0:
+                    continue
+
+                same_row = (
+                    abs(items[i]["base_cy"] - items[j]["base_cy"])
+                    <= row_thresh * max(items[i]["bh"], items[j]["bh"])
+                )
+                same_col = (
+                    abs(items[i]["base_cx"] - items[j]["base_cx"])
+                    <= col_thresh * max(items[i]["bw"], items[j]["bw"])
+                )
+
+                need_x = ox + gap_px
+                need_y = oy + gap_px
+
+                if same_row and not same_col:
+                    first_axis = "x"
+                elif same_col and not same_row:
+                    first_axis = "y"
+                else:
+                    first_axis = "x" if need_x <= need_y else "y"
+
+                if first_axis == "x":
+                    moved = move_pair_x(i, j, need_x)
+                else:
+                    moved = move_pair_y(i, j, need_y)
+
+                if moved > 1e-6:
+                    changed = True
+
+                ri = rect(items[i])
+                rj = rect(items[j])
+
+                ox = overlap_1d(ri["left"], ri["right"], rj["left"], rj["right"])
+                oy = overlap_1d(ri["top"], ri["bottom"], rj["top"], rj["bottom"])
+
+                if ox > 0 and oy > 0:
+                    if first_axis == "x":
+                        moved = move_pair_y(i, j, oy + gap_px)
+                    else:
+                        moved = move_pair_x(i, j, ox + gap_px)
+
+                    if moved > 1e-6:
+                        changed = True
+
+        if not changed:
+            break
+
+    for k, it in enumerate(items):
+        w = it["w_norm"]
+        h = it["h_norm"]
+
+        new_x = (it["base_cx"] + it["shift_x"] - it["bw"] / 2) / W
+        new_y = (it["base_cy"] + it["shift_y"] - it["bh"] / 2) / H
+
+        new_x = min(max(new_x, 0.0), max(0.0, 1.0 - w))
+        new_y = min(max(new_y, 0.0), max(0.0, 1.0 - h))
+
+        out[k]["bbox_norm_xywh"] = [new_x, new_y, w, h]
+
+    return out
+
+def render_full_glyph_canvas(layout_items, width: int, height: int,
+                             glyph_patch_mode: str = "match_box",
+                             debug: bool = False) -> Image.Image:
+    return _render_full_glyph_canvas(
+        layout_items, width, height, glyph_patch_mode, debug,
+        adjust_matches=adjust_matches_by_real_glyph_overlap_2d,
+    )
+
+
+class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
+    r"""
+    The Qwen-Image-Edit pipeline for image editing.
+
+    Args:
+        transformer ([`QwenImageTransformer2DModel`]):
+            Conditional Transformer (MMDiT) architecture to denoise the encoded image latents.
+        scheduler ([`FlowMatchEulerDiscreteScheduler`]):
+            A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
+        vae ([`AutoencoderKL`]):
+            Variational Auto-Encoder (VAE) Model to encode and decode images to and from latent representations.
+        text_encoder ([`Qwen2.5-VL-7B-Instruct`]):
+            [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct), specifically the
+            [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) variant.
+        tokenizer (`QwenTokenizer`):
+            Tokenizer of class
+            [CLIPTokenizer](https://huggingface.co/docs/transformers/en/model_doc/clip#transformers.CLIPTokenizer).
+    """
+
+    model_cpu_offload_seq = "text_encoder->transformer->vae"
+    _callback_tensor_inputs = ["latents", "prompt_embeds"]
+
+    def __init__(
+        self,
+        scheduler: FlowMatchEulerDiscreteScheduler,
+        vae: AutoencoderKLQwenImage,
+        text_encoder: Qwen2_5_VLForConditionalGeneration,
+        tokenizer: Qwen2Tokenizer,
+        processor: Qwen2VLProcessor,
+        transformer: QwenImageTransformer2DModel,
+    ):
+        super().__init__()
+
+        self.register_modules(
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            processor=processor,
+            transformer=transformer,
+            scheduler=scheduler,
+        )
+        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
+        self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 16
+        # QwenImage latents are turned into 2x2 patches and packed. This means the latent width and height has to be divisible
+        # by the patch size. So the vae scale factor is multiplied by the patch size to account for this
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+        self.tokenizer_max_length = 1024
+
+        self.prompt_template_encode_edit = (
+            "<|im_start|>system\n"
+            "Describe the key features of the input image (color, shape, size, texture, objects, background), "
+            "then explain how the user's text instruction should alter or modify the image. "
+            "Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate."
+            "<|im_end|>\n"
+            "<|im_start|>user\n{}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        self.prompt_template_encode_edit_start_idx = 64
+
+        self.prompt_template_encode_t2i = (
+            "<|im_start|>system\n"
+            "Describe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:"
+            "<|im_end|>\n"
+            "<|im_start|>user\n{}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        self.prompt_template_encode_t2i_start_idx = 34
+        self.default_sample_size = 128
+
+    # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._extract_masked_hidden
+    def _extract_masked_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor):
+        bool_mask = mask.bool()
+        valid_lengths = bool_mask.sum(dim=1)
+        selected = hidden_states[bool_mask]
+        split_result = torch.split(selected, valid_lengths.tolist(), dim=0)
+
+        return split_result
+
+    def _extract_quoted_spans(self, text: str) -> List[Tuple[int, int, str]]:
+        """
+        返回 (start, end, inner)：
+        start/end 是包含引号在内的 span 区间，inner 是引号内内容
+        只处理：
+        "..."  “...”  '...'  ‘...’
+        其中单引号不会把英文单词内部的 apostrophe 当成引号
+        """
+        if not text:
+            return []
+
+        patterns = [
+            r'"([^"\n]+)"',
+            r'“([^”\n]+)”',
+            r"'([^'\n]+)'",
+            r"‘([^’\n]+)’",
+        ]
+
+        spans = []
+        for pat in patterns:
+            for m in re.finditer(pat, text):
+                inner = (m.group(1) or "").strip()
+                if inner:
+                    spans.append((m.start(0), m.end(0), inner))
+
+        spans.sort(key=lambda x: (x[0], x[1]))
+
+        filtered = []
+        last_end = -1
+        for s, e, inner in spans:
+            if s < last_end:
+                continue
+            filtered.append((s, e, inner))
+            last_end = e
+
+        return filtered
+
+    def build_layout_matches_and_glyphs(
+        self,
+        glyph_layout_items,
+        canvas_size,
+        glyph_patch_mode: str = "fixed_line_height",  # fixed_line_height or match_box
+        debug: bool = False,
+    ):
+        if not glyph_layout_items:
+            return [], []
+
+        raw_matches = []
+        for item in glyph_layout_items:
+            tight = _simulate_tight_bbox(item, canvas_size)
+            bbox_norm_xywh = tight["bbox_norm_xywh"]
+            if not bbox_norm_xywh:
+                continue
+
+            raw_matches.append(
+                {
+                    **({"align": item["align"]} if "align" in item else {}),
+                    **({"layout_frame": list(item["bbox"])} if "align" in item or "valign" in item else {}),
+                    **({"valign": item["valign"]} if "valign" in item else {}),
+                    "text": tight["text"],
+                    "bbox": tight["bbox"],
+                    "bbox_norm_xywh": bbox_norm_xywh,
+                }
+            )
+
+        raw_matches = dedup_layout_matches(raw_matches)
+
+        raw_layout_glyph_images = [
+            render_one_glyph_patch(m, canvas_size, glyph_patch_mode)
+            for m in raw_matches
+        ]
+
+        raw_matches = anchor_glyph_patches(raw_matches, raw_layout_glyph_images, canvas_size)
+        raw_matches = adjust_matches_by_real_glyph_overlap_2d(
+            raw_matches,
+            raw_layout_glyph_images,
+            canvas_size,
+            gap_px=1,
+        )
+
+        matches = merge_layout_matches_to_blocks(
+            raw_matches,
+            canvas_size,
+            glyph_images=raw_layout_glyph_images,
+            expand_x_ratio=0.05,
+            expand_y_ratio=0.20,
+            max_height_ratio=1.8,
+        )
+
+        vae_glyph_images = []
+        for m in matches:
+            children = m.get("children")
+
+            if children and len(children) > 1:
+                glyph = compose_glyph_group_image(
+                    children,
+                    raw_layout_glyph_images,
+                    m["bbox_norm_xywh"],
+                    canvas_size,
+                )
+            elif children and len(children) == 1:
+                glyph = raw_layout_glyph_images[children[0]["idx"]]
+            else:
+                glyph = render_one_glyph_patch(m, canvas_size, glyph_patch_mode)
+
+            glyph = ensure_side(glyph, min_side=16, multiple=16)
+            vae_glyph_images.append(glyph)
+
+        assert len(matches) == len(vae_glyph_images)
+
+        if debug:
+            debug_canvas = Image.new("RGB", canvas_size, "white")
+            draw = ImageDraw.Draw(debug_canvas)
+            img_w, img_h = canvas_size
+
+            i = 0
+            for match, glyph_img in zip(matches, vae_glyph_images):
+                bbox = match.get("bbox_norm_xywh")
+                if not bbox or len(bbox) != 4:
+                    continue
+
+                x, y, w, h = bbox
+                x1 = int(x * img_w)
+                y1 = int(y * img_h)
+                bw = int(w * img_w)
+                bh = int(h * img_h)
+                x2 = x1 + bw
+                y2 = y1 + bh
+
+                glyph_img = glyph_img.convert("RGBA")
+                gw, gh = glyph_img.size
+                cx = x1 + bw // 2
+                cy = y1 + bh // 2
+                paste_x = cx - gw // 2
+                paste_y = cy - gh // 2
+
+                debug_canvas.paste(glyph_img, (paste_x, paste_y), glyph_img)
+                draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=2)
+                # glyph_img.save(f"glyph_debug_sub_{i}.png")
+                i+=1
+
+            debug_canvas.save("glyph_debug.png")
+            print("[debug] saved glyph debug image to: glyph_debug.png")
+
+        return matches, vae_glyph_images
+
+    def _has_real_images(self, image) -> bool:
+        if image is None:
+            return False
+        if isinstance(image, list):
+            return len(image) > 0
+        return True
+
+
+    def _get_mode_flags(self, image, glyph_layout_items, prompt) -> Dict[str, bool]:
+        has_real_images = self._has_real_images(image)
+        has_layout_glyphs = glyph_layout_items is not None and len(glyph_layout_items) > 0
+
+        if isinstance(prompt, list):
+            prompt_for_glyph = prompt[0] if len(prompt) > 0 else ""
+        else:
+            prompt_for_glyph = prompt or ""
+
+        has_prompt_glyphs = len(self._extract_quoted_spans(prompt_for_glyph)) > 0
+        has_glyph_images = has_layout_glyphs or has_prompt_glyphs
+
+        return {
+            "has_real_images": has_real_images,
+            "has_glyph_images": has_glyph_images,
+            "use_condition_images": has_real_images or has_glyph_images,
+            "use_edit_template": has_real_images,
+        }
+
+    def _build_all_condition_images(
+        self,
+        image: Optional[PipelineImageInput],
+        glyph_layout_items: Optional[List[Dict[str, Any]]],
+        prompt_for_glyph: Optional[Union[str, List[str]]],
+        canvas_size: Tuple[int, int],
+        prompt_glyph_target_ratio: float = 4.0,
+        glyph_patch_mode: str = "fixed_line_height",
+        debug: bool = False,
+    ):
+        real_images: List[Any] = []
+        if image is not None:
+            if isinstance(image, list):
+                real_images = list(image)
+            else:
+                real_images = [image]
+
+        if isinstance(prompt_for_glyph, list):
+            glyph_prompt_text = prompt_for_glyph[0] if len(prompt_for_glyph) > 0 else ""
+        else:
+            glyph_prompt_text = prompt_for_glyph or ""
+
+        layout_matches = []
+        vae_glyph_images = []
+        if glyph_layout_items:
+            layout_matches, vae_glyph_images = self.build_layout_matches_and_glyphs(
+                glyph_layout_items=glyph_layout_items,
+                canvas_size=canvas_size,
+                glyph_patch_mode=glyph_patch_mode,
+                debug=debug,
+            )
+
+        prompt_glyph_images = self.build_prompt_glyph_images_from_text(
+            glyph_prompt_text,
+            prompt_glyph_target_ratio=prompt_glyph_target_ratio,
+        )
+
+        return real_images, vae_glyph_images, prompt_glyph_images, layout_matches
+
+    def _prepare_vae_tensors(
+        self,
+        real_images: List[Image.Image],
+        glyph_images: List[Image.Image],
+        vae_image_size: int = VAE_IMAGE_SIZE,
+    ):
+        """为 VAE latent 注入准备图像张量。glyph 图像保持原始尺寸，不按比例缩放。"""
+        vae_image_sizes = []
+        vae_images = []
+
+        for img in real_images:
+            image_width, image_height = img.size
+            vae_width, vae_height = calculate_dimensions(vae_image_size, image_width / image_height)
+            vae_image_sizes.append((vae_width, vae_height))
+            vae_images.append(self.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
+
+        for img in glyph_images:
+            image_width, image_height = img.size
+            vae_image_sizes.append((image_width, image_height))
+            vae_images.append(self.image_processor.preprocess(img, image_height, image_width).unsqueeze(2))
+
+        return vae_image_sizes, vae_images
+
+    def _prepare_condition_images(
+        self,
+        real_images: List[Image.Image],
+    ):
+        """为 VLM（encode_prompt）准备按比例缩放到 CONDITION_IMAGE_SIZE 的图像列表。"""
+        condition_image_sizes = []
+        condition_images = []
+
+        for img in real_images:
+            image_width, image_height = img.size
+            condition_width, condition_height = calculate_dimensions(
+                CONDITION_IMAGE_SIZE, image_width / image_height
+            )
+            condition_image_sizes.append((condition_width, condition_height))
+            condition_images.append(self.image_processor.resize(img, condition_height, condition_width))
+
+        return condition_image_sizes, condition_images
+
+    def _build_image_token_ranges(
+        self,
+        img_shapes: List[List[Tuple[int, int, int]]],
+        n_real: int,
+        n_glyph: int,
+    ):
+        """
+        joint image 序列中的 range，基于 img_shapes 计算。
+        返回每个 sample:
+        {
+            "noise": (s, e),
+            "real": {i: (s, e)},
+            "glyph": {i: (s, e)},
+            "total_img_len": int,
+        }
+        """
+        batch_ranges = []
+
+        for one_sample in img_shapes:
+            cursor = 0
+            sample_ranges = {
+                "noise": None,
+                "real": {},
+                "glyph": {},
+                "total_img_len": 0,
+            }
+
+            for idx, (_, h, w) in enumerate(one_sample):
+                seg_len = h * w
+                s, e = cursor, cursor + seg_len
+
+                if idx == 0:
+                    sample_ranges["noise"] = (s, e)
+                else:
+                    cond_idx = idx - 1
+                    if cond_idx < n_real:
+                        sample_ranges["real"][cond_idx] = (s, e)
+                    else:
+                        glyph_idx = cond_idx - n_real
+                        if glyph_idx < n_glyph:
+                            sample_ranges["glyph"][glyph_idx] = (s, e)
+
+                cursor = e
+
+            sample_ranges["total_img_len"] = cursor
+            batch_ranges.append(sample_ranges)
+
+        return batch_ranges
+
+    def build_prompt_glyph_images_from_text(
+        self,
+        prompt_text: str,
+        prompt_glyph_target_ratio: float = 4.0,
+    ):
+        glyph_images = []
+        for _, _, inner in self._extract_quoted_spans(prompt_text or ""):
+            glyph = render_glyph_image(
+                inner,
+                mode="fixed_line_height",
+                target_ratio=prompt_glyph_target_ratio,
+            )
+            glyph = ensure_side(glyph, min_side=16, multiple=16)
+            glyph_images.append(glyph)
+        return glyph_images
+
+    def _get_qwen_prompt_embeds(
+        self,
+        prompt: Union[str, List[str]] = None,
+        image: Optional[torch.Tensor] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        device = device or self._execution_device
+        dtype = dtype or self.text_encoder.dtype
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+
+        if isinstance(image, list):
+            real_images = list(image)
+        elif image is not None:
+            real_images = [image]
+        else:
+            real_images = []
+
+        use_condition_images = len(real_images) > 0
+        use_edit_template = len(real_images) > 0
+
+        if not use_condition_images:
+            template = self.prompt_template_encode_t2i
+            drop_idx = self.prompt_template_encode_t2i_start_idx
+
+            txt = [template.format(e or "") for e in prompt]
+            txt_tokens = self.tokenizer(
+                txt,
+                max_length=self.tokenizer_max_length + drop_idx,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            ).to(device)
+
+            encoder_hidden_states = self.text_encoder(
+                input_ids=txt_tokens.input_ids,
+                attention_mask=txt_tokens.attention_mask,
+                output_hidden_states=True,
+            )
+            hidden_states = encoder_hidden_states.hidden_states[-1]
+            split_hidden_states = self._extract_masked_hidden(hidden_states, txt_tokens.attention_mask)
+            split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
+
+            attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
+            max_seq_len = max(e.size(0) for e in split_hidden_states)
+
+            prompt_embeds = torch.stack(
+                [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
+            )
+            encoder_attention_mask = torch.stack(
+                [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
+            )
+
+            prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+            return prompt_embeds, encoder_attention_mask
+
+        template = self.prompt_template_encode_edit if use_edit_template else self.prompt_template_encode_t2i
+        drop_idx = (
+            self.prompt_template_encode_edit_start_idx
+            if use_edit_template
+            else self.prompt_template_encode_t2i_start_idx
+        )
+
+        image_placeholder = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
+
+        txt_list: List[str] = []
+        images_batch: List[List[Any]] = []
+
+        for p in prompt:
+            parts = []
+            for real_idx in range(len(real_images)):
+                parts.append(image_placeholder.format(real_idx + 1))
+            parts.append(p or "")
+            full_prompt = "".join(parts)
+            txt_list.append(template.format(full_prompt))
+            images_batch.append(list(real_images))
+
+        if len(txt_list) == 1:
+            images_for_processor = images_batch[0]
+        else:
+            images_for_processor = images_batch
+
+        model_inputs = self.processor(
+            text=txt_list,
+            images=images_for_processor,
+            padding=True,
+            return_tensors="pt",
+        ).to(device)
+
+        outputs = self.text_encoder(
+            input_ids=model_inputs.input_ids,
+            attention_mask=model_inputs.attention_mask,
+            pixel_values=model_inputs.pixel_values,
+            image_grid_thw=model_inputs.image_grid_thw,
+            output_hidden_states=True,
+        )
+
+        hidden_states = outputs.hidden_states[-1]
+        split_hidden_states = self._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
+        split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
+
+        attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
+        max_seq_len = max(e.size(0) for e in split_hidden_states)
+
+        prompt_embeds = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
+        )
+        encoder_attention_mask = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
+        )
+
+        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+        return prompt_embeds, encoder_attention_mask
+
+    # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit.QwenImageEditPipeline.encode_prompt
+    def encode_prompt(
+        self,
+        prompt: Union[str, List[str]],
+        image: Optional[torch.Tensor] = None,
+        device: Optional[torch.device] = None,
+        num_images_per_prompt: int = 1,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        prompt_embeds_mask: Optional[torch.Tensor] = None,
+        max_sequence_length: int = 1024,
+    ):
+        r"""
+
+        Args:
+            prompt (`str` or `List[str]`, *optional*):
+                prompt to be encoded
+            image (`torch.Tensor`, *optional*):
+                image to be encoded
+            device: (`torch.device`):
+                torch device
+            num_images_per_prompt (`int`):
+                number of images that should be generated per prompt
+            prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
+                provided, text embeddings will be generated from `prompt` input argument.
+        """
+        device = device or self._execution_device
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        batch_size = len(prompt) if prompt_embeds is None else prompt_embeds.shape[0]
+
+        if prompt_embeds is None:
+            prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(
+                prompt=prompt,
+                image=image,
+                device=device,
+            )
+
+        _, seq_len, _ = prompt_embeds.shape
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+        prompt_embeds_mask = prompt_embeds_mask.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds_mask = prompt_embeds_mask.view(batch_size * num_images_per_prompt, seq_len)
+
+        return prompt_embeds, prompt_embeds_mask
+
+    # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit.QwenImageEditPipeline.check_inputs
+    def check_inputs(
+        self,
+        prompt,
+        height,
+        width,
+        negative_prompt=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_embeds_mask=None,
+        negative_prompt_embeds_mask=None,
+        callback_on_step_end_tensor_inputs=None,
+        max_sequence_length=None,
+    ):
+        if height % (self.vae_scale_factor * 2) != 0 or width % (self.vae_scale_factor * 2) != 0:
+            logger.warning(
+                f"`height` and `width` have to be divisible by {self.vae_scale_factor * 2} but are {height} and {width}. Dimensions will be resized accordingly"
+            )
+
+        if callback_on_step_end_tensor_inputs is not None and not all(
+            k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
+        ):
+            raise ValueError(
+                f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found {[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
+            )
+
+        if prompt is not None and prompt_embeds is not None:
+            raise ValueError(
+                f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
+                " only forward one of the two."
+            )
+        elif prompt is None and prompt_embeds is None:
+            raise ValueError(
+                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
+            )
+        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
+            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+
+        if negative_prompt is not None and negative_prompt_embeds is not None:
+            raise ValueError(
+                f"Cannot forward both `negative_prompt`: {negative_prompt} and `negative_prompt_embeds`:"
+                f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
+            )
+
+        if prompt_embeds is not None and prompt_embeds_mask is None:
+            raise ValueError(
+                "If `prompt_embeds` are provided, `prompt_embeds_mask` also have to be passed. Make sure to generate `prompt_embeds_mask` from the same text encoder that was used to generate `prompt_embeds`."
+            )
+        if negative_prompt_embeds is not None and negative_prompt_embeds_mask is None:
+            raise ValueError(
+                "If `negative_prompt_embeds` are provided, `negative_prompt_embeds_mask` also have to be passed. Make sure to generate `negative_prompt_embeds_mask` from the same text encoder that was used to generate `negative_prompt_embeds`."
+            )
+
+        if max_sequence_length is not None and max_sequence_length > 1024:
+            raise ValueError(f"`max_sequence_length` cannot be greater than 1024 but is {max_sequence_length}")
+
+    @staticmethod
+    # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._pack_latents
+    def _pack_latents(latents, batch_size, num_channels_latents, height, width):
+        latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+        latents = latents.permute(0, 2, 4, 1, 3, 5)
+        latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+
+        return latents
+
+    @staticmethod
+    # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._unpack_latents
+    def _unpack_latents(latents, height, width, vae_scale_factor):
+        batch_size, num_patches, channels = latents.shape
+
+        # VAE applies 8x compression on images but we must also account for packing which requires
+        # latent height and width to be divisible by 2.
+        height = 2 * (int(height) // (vae_scale_factor * 2))
+        width = 2 * (int(width) // (vae_scale_factor * 2))
+
+        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
+        latents = latents.permute(0, 3, 1, 4, 2, 5)
+
+        latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
+
+        return latents
+
+    # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit.QwenImageEditPipeline._encode_vae_image
+    def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
+        if isinstance(generator, list):
+            image_latents = [
+                retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i], sample_mode="argmax")
+                for i in range(image.shape[0])
+            ]
+            image_latents = torch.cat(image_latents, dim=0)
+        else:
+            image_latents = retrieve_latents(self.vae.encode(image), generator=generator, sample_mode="argmax")
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.latent_channels, 1, 1, 1)
+            .to(image_latents.device, image_latents.dtype)
+        )
+        latents_std = (
+            torch.tensor(self.vae.config.latents_std)
+            .view(1, self.latent_channels, 1, 1, 1)
+            .to(image_latents.device, image_latents.dtype)
+        )
+        image_latents = (image_latents - latents_mean) / latents_std
+
+        return image_latents
+
+    def prepare_latents(
+        self,
+        images,
+        batch_size,
+        num_channels_latents,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+        latents=None,
+    ):
+        height = 2 * (int(height) // (self.vae_scale_factor * 2))
+        width = 2 * (int(width) // (self.vae_scale_factor * 2))
+
+        shape = (batch_size, 1, num_channels_latents, height, width)
+
+        image_latents = None
+        if images is not None and len(images) == 0:
+            images = None
+
+        if images is not None:
+            if not isinstance(images, list):
+                images = [images]
+
+            all_image_latents = []
+            for image in images:
+                image = image.to(device=device, dtype=dtype)
+                if image.shape[1] != self.latent_channels:
+                    image_latents = self._encode_vae_image(image=image, generator=generator)
+                else:
+                    image_latents = image
+
+                if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
+                    additional_image_per_prompt = batch_size // image_latents.shape[0]
+                    image_latents = torch.cat([image_latents] * additional_image_per_prompt, dim=0)
+                elif batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] != 0:
+                    raise ValueError(
+                        f"Cannot duplicate `image` of batch size {image_latents.shape[0]} to {batch_size} text prompts."
+                    )
+                else:
+                    image_latents = torch.cat([image_latents], dim=0)
+
+                image_latent_height, image_latent_width = image_latents.shape[3:]
+                image_latents = self._pack_latents(
+                    image_latents, batch_size, num_channels_latents, image_latent_height, image_latent_width
+                )
+                all_image_latents.append(image_latents)
+
+            if len(all_image_latents) > 0:
+                image_latents = torch.cat(all_image_latents, dim=1)
+            else:
+                image_latents = None
+
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+        if latents is None:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
+        else:
+            latents = latents.to(device=device, dtype=dtype)
+
+        return latents, image_latents
+
+    @property
+    def guidance_scale(self):
+        return self._guidance_scale
+
+    @property
+    def attention_kwargs(self):
+        return self._attention_kwargs
+
+    @property
+    def num_timesteps(self):
+        return self._num_timesteps
+
+    @property
+    def current_timestep(self):
+        return self._current_timestep
+
+    @property
+    def interrupt(self):
+        return self._interrupt
+
+    @torch.no_grad()
+    @replace_example_docstring(EXAMPLE_DOC_STRING)
+    def __call__(
+        self,
+        image: Optional[PipelineImageInput] = None,
+        prompt: Union[str, List[str]] = None,
+        negative_prompt: Union[str, List[str]] = None,
+        glyph_layout_path: Optional[Union[str, Path]] = None,
+        glyph_layout_items: Optional[List[Dict[str, Any]]] = None,
+        prompt_glyph_target_ratio: float = 4.0,
+        true_cfg_scale: float = 4.0,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        sigmas: Optional[List[float]] = None,
+        guidance_scale: Optional[float] = None,
+        num_images_per_prompt: int = 1,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.Tensor] = None,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        prompt_embeds_mask: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        negative_prompt_embeds_mask: Optional[torch.Tensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        max_sequence_length: int = 512,
+        canvas_area: int = VAE_IMAGE_SIZE,
+        glyph_patch_mode: str = "fixed_line_height",
+        no_glyph_layout: bool = False,
+        full_glyph_ref: bool = False,
+        debug: bool = False,
+    ):
+        r"""
+        Function invoked when calling the pipeline for generation.
+
+        Args:
+            image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.Tensor]`, `List[PIL.Image.Image]`, or `List[np.ndarray]`):
+                `Image`, numpy array or tensor representing an image batch to be used as the starting point. For both
+                numpy array and pytorch tensor, the expected value range is between `[0, 1]` If it's a tensor or a list
+                or tensors, the expected shape should be `(B, C, H, W)` or `(C, H, W)`. If it is a numpy array or a
+                list of arrays, the expected shape should be `(B, H, W, C)` or `(H, W, C)` It can also accept image
+                latents as `image`, but if passing latents directly it is not encoded again.
+            prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
+                instead.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. If not defined, one has to pass
+                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `true_cfg_scale` is
+                not greater than `1`).
+            true_cfg_scale (`float`, *optional*, defaults to 1.0):
+                true_cfg_scale (`float`, *optional*, defaults to 1.0): Guidance scale as defined in [Classifier-Free
+                Diffusion Guidance](https://huggingface.co/papers/2207.12598). `true_cfg_scale` is defined as `w` of
+                equation 2. of [Imagen Paper](https://huggingface.co/papers/2205.11487). Classifier-free guidance is
+                enabled by setting `true_cfg_scale > 1` and a provided `negative_prompt`. Higher guidance scale
+                encourages to generate images that are closely linked to the text `prompt`, usually at the expense of
+                lower image quality.
+            height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
+                The height in pixels of the generated image. This is set to 1024 by default for the best results.
+            width (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
+                The width in pixels of the generated image. This is set to 1024 by default for the best results.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            sigmas (`List[float]`, *optional*):
+                Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
+                their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
+                will be used.
+            guidance_scale (`float`, *optional*, defaults to None):
+                A guidance scale value for guidance distilled models. Unlike the traditional classifier-free guidance
+                where the guidance scale is applied during inference through noise prediction rescaling, guidance
+                distilled models take the guidance scale directly as an input parameter during forward pass. Guidance
+                scale is enabled by setting `guidance_scale > 1`. Higher guidance scale encourages to generate images
+                that are closely linked to the text `prompt`, usually at the expense of lower image quality. This
+                parameter in the pipeline is there to support future guidance-distilled models when they come up. It is
+                ignored when not using guidance distilled models. To enable traditional classifier-free guidance,
+                please pass `true_cfg_scale > 1.0` and `negative_prompt` (even an empty negative prompt like " " should
+                enable classifier-free guidance computations).
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                Must be 1; only one output image per call is supported.
+            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
+                to make generation deterministic.
+            latents (`torch.Tensor`, *optional*):
+                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor will be generated by sampling using the supplied random `generator`.
+            prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
+                provided, text embeddings will be generated from `prompt` input argument.
+            negative_prompt_embeds (`torch.Tensor`, *optional*):
+                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
+                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
+                argument.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.qwenimage.QwenImagePipelineOutput`] instead of a plain tuple.
+            attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            callback_on_step_end (`Callable`, *optional*):
+                A function that calls at the end of each denoising steps during the inference. The function is called
+                with the following arguments: `callback_on_step_end(self: DiffusionPipeline, step: int, timestep: int,
+                callback_kwargs: Dict)`. `callback_kwargs` will include a list of all tensors as specified by
+                `callback_on_step_end_tensor_inputs`.
+            callback_on_step_end_tensor_inputs (`List`, *optional*):
+                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
+                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
+                `._callback_tensor_inputs` attribute of your pipeline class.
+            max_sequence_length (`int` defaults to 512): Maximum sequence length to use with the `prompt`.
+
+        Examples:
+
+        Returns:
+            [`~pipelines.qwenimage.QwenImagePipelineOutput`] or `tuple`:
+            [`~pipelines.qwenimage.QwenImagePipelineOutput`] if `return_dict` is True, otherwise a `tuple`. When
+            returning a tuple, the first element is a list with the generated images.
+        """
+        if num_images_per_prompt != 1:
+            raise ValueError("Only one output image per call is supported; num_images_per_prompt must be 1.")
+        if isinstance(prompt, list) and len(prompt) != 1:
+            raise ValueError("Only one prompt per call is supported.")
+        if prompt_embeds is not None and len(prompt_embeds) != 1:
+            raise ValueError("Only one prompt embedding batch item per call is supported.")
+        if glyph_layout_items is None and glyph_layout_path is not None:
+            glyph_layout_items = load_glyph_layout_items(glyph_layout_path)
+        mode_flags = self._get_mode_flags(
+            image=image,
+            glyph_layout_items=glyph_layout_items,
+            prompt=prompt,
+        )
+        has_real_images = mode_flags["has_real_images"]
+        has_glyph_images = mode_flags["has_glyph_images"]
+        use_condition_images = mode_flags["use_condition_images"]
+
+        if has_real_images:
+            first_image = image[0] if isinstance(image, list) else image
+            image_size = first_image.size
+            calculated_width, calculated_height = calculate_dimensions(canvas_area, image_size[0] / image_size[1])
+            height = height or calculated_height
+            width = width or calculated_width
+        else:
+            height = height or self.default_sample_size * self.vae_scale_factor
+            width = width or self.default_sample_size * self.vae_scale_factor
+
+        multiple_of = self.vae_scale_factor * 2
+        width = width // multiple_of * multiple_of
+        height = height // multiple_of * multiple_of
+
+        # full_glyph_ref: 渲染 glyph 全图作为额外参考图，不走 GlyphAnchor 注入
+        if full_glyph_ref and glyph_layout_items:
+            glyph_canvas = render_full_glyph_canvas(glyph_layout_items, width, height,
+                                                    glyph_patch_mode=glyph_patch_mode, debug=debug)
+            if image is None:
+                image = [glyph_canvas]
+            elif isinstance(image, list):
+                image = list(image) + [glyph_canvas]
+            else:
+                image = [image, glyph_canvas]
+            glyph_layout_items = None
+            has_real_images = True
+
+        # 1. Check inputs. Raise error if not correct
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            negative_prompt=negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            max_sequence_length=max_sequence_length,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = attention_kwargs
+        self._current_timestep = None
+        self._interrupt = False
+
+        # 2. Define call parameters
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        device = self._execution_device
+        real_images, vae_glyph_images, prompt_glyph_images, layout_matches = self._build_all_condition_images(
+            image=image,
+            glyph_layout_items=glyph_layout_items,
+            prompt_for_glyph=prompt,
+            canvas_size=(width, height),
+            prompt_glyph_target_ratio=prompt_glyph_target_ratio,
+            glyph_patch_mode=glyph_patch_mode,
+            debug=debug,
+        )
+        n_real_images = 0
+        if has_real_images:
+            n_real_images = len(real_images) if isinstance(real_images, list) else 1
+        if no_glyph_layout:
+            # treat all condition images (real + glyph) as real images,
+            # so the transformer applies no glyph-layout-specific attention
+            n_real_images = len(vae_glyph_images) + (len(real_images) if isinstance(real_images, list) else (1 if has_real_images else 0))
+            layout_matches = []
+        cond_real_images = list(real_images)
+        cond_vae_glyph_images = list(vae_glyph_images)
+        cond_prompt_glyph_images = list(prompt_glyph_images)
+
+        uncond_real_images = list(real_images)
+        uncond_vae_glyph_images = []
+        uncond_prompt_glyph_images = []
+
+        # 3. Preprocess image
+        cond_vae_image_sizes, cond_vae_images = self._prepare_vae_tensors(
+            cond_real_images,
+            cond_vae_glyph_images,
+            vae_image_size=canvas_area,
+        )
+
+        uncond_vae_image_sizes, uncond_vae_images = self._prepare_vae_tensors(
+            uncond_real_images,
+            uncond_vae_glyph_images,
+            vae_image_size=canvas_area,
+        )
+
+        cond_condition_image_sizes, cond_condition_images = self._prepare_condition_images(
+            cond_real_images,
+        )
+
+        uncond_condition_image_sizes, uncond_condition_images = self._prepare_condition_images(
+            uncond_real_images,
+        )
+
+        cond_condition_images = cond_condition_images if len(cond_condition_images) > 0 else None
+        cond_vae_images = cond_vae_images if len(cond_vae_images) > 0 else None
+        uncond_condition_images = uncond_condition_images if len(uncond_condition_images) > 0 else None
+        uncond_vae_images = uncond_vae_images if len(uncond_vae_images) > 0 else None
+
+        has_neg_prompt = negative_prompt is not None or (
+            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
+        )
+
+        if true_cfg_scale > 1 and not has_neg_prompt:
+            logger.warning(
+                f"true_cfg_scale is passed as {true_cfg_scale}, but classifier-free guidance is not enabled since no negative_prompt is provided."
+            )
+        elif true_cfg_scale <= 1 and has_neg_prompt:
+            logger.warning(
+                " negative_prompt is passed but classifier-free guidance is not enabled since true_cfg_scale <= 1"
+            )
+
+        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+            prompt=prompt,
+            image=cond_condition_images,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+        if do_true_cfg:
+            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                prompt=negative_prompt,
+                image=uncond_condition_images,
+                prompt_embeds=negative_prompt_embeds,
+                prompt_embeds_mask=negative_prompt_embeds_mask,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+            )
+
+        # 4. Prepare latent variables
+        num_channels_latents = self.transformer.config.in_channels // 4
+
+        latents, cond_image_latents = self.prepare_latents(
+            cond_vae_images,
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
+
+        _, uncond_image_latents = self.prepare_latents(
+            uncond_vae_images,
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents=None,
+        )
+
+        cond_img_shapes = [
+            [
+                (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2),
+                *[
+                    (1, vae_height // self.vae_scale_factor // 2, vae_width // self.vae_scale_factor // 2)
+                    for vae_width, vae_height in cond_vae_image_sizes
+                ],
+            ]
+        ] * batch_size
+
+        uncond_img_shapes = [
+            [
+                (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2),
+                *[
+                    (1, vae_height // self.vae_scale_factor // 2, vae_width // self.vae_scale_factor // 2)
+                    for vae_width, vae_height in uncond_vae_image_sizes
+                ],
+            ]
+        ] * batch_size
+
+        # 5. Prepare timesteps
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        image_seq_len = latents.shape[1]
+        mu = calculate_shift(
+            image_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
+        )
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            device,
+            sigmas=sigmas,
+            mu=mu,
+        )
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        self._num_timesteps = len(timesteps)
+
+        # handle guidance
+        if self.transformer.config.guidance_embeds and guidance_scale is None:
+            raise ValueError("guidance_scale is required for guidance-distilled model.")
+        elif self.transformer.config.guidance_embeds:
+            guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+        elif not self.transformer.config.guidance_embeds and guidance_scale is not None:
+            logger.warning(
+                f"guidance_scale is passed as {guidance_scale}, but ignored since the model is not guidance-distilled."
+            )
+            guidance = None
+        elif not self.transformer.config.guidance_embeds and guidance_scale is None:
+            guidance = None
+
+        if self.attention_kwargs is None:
+            self._attention_kwargs = {}
+
+        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
+        negative_txt_seq_lens = (
+            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
+        )
+
+
+
+        # 6. Denoising loop
+        self.scheduler.set_begin_index(0)
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                self._current_timestep = t
+
+                cond_latent_model_input = latents
+                if cond_image_latents is not None:
+                    cond_latent_model_input = torch.cat([latents, cond_image_latents], dim=1)
+
+                if do_true_cfg:
+                    uncond_latent_model_input = latents
+                    if uncond_image_latents is not None:
+                        uncond_latent_model_input = torch.cat([latents, uncond_image_latents], dim=1)
+
+                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                with self.transformer.cache_context("cond"):
+                    cond_attention_kwargs = dict(self.attention_kwargs or {})
+                    noise_pred = self.transformer(
+                        hidden_states=cond_latent_model_input,
+                        timestep=timestep / 1000,
+                        guidance=guidance,
+                        encoder_hidden_states_mask=prompt_embeds_mask,
+                        encoder_hidden_states=prompt_embeds,
+                        img_shapes=cond_img_shapes,
+                        txt_seq_lens=txt_seq_lens,
+                        attention_kwargs=cond_attention_kwargs,
+                        n_real_images=n_real_images,
+                        layout_matches=layout_matches,
+                        return_dict=False,
+                    )[0]
+                    noise_pred = noise_pred[:, : latents.size(1)]
+
+                if do_true_cfg:
+                    with self.transformer.cache_context("uncond"):
+                        neg_noise_pred = self.transformer(
+                            hidden_states=uncond_latent_model_input,
+                            timestep=timestep / 1000,
+                            guidance=guidance,
+                            encoder_hidden_states_mask=negative_prompt_embeds_mask,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            img_shapes=uncond_img_shapes,
+                            txt_seq_lens=negative_txt_seq_lens,
+                            attention_kwargs=self.attention_kwargs,
+                            return_dict=False,
+                        )[0]
+                    neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
+                    comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+
+                    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+                    noise_pred = comb_pred * (cond_norm / noise_norm)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents_dtype = latents.dtype
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                if latents.dtype != latents_dtype:
+                    if torch.backends.mps.is_available():
+                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                        latents = latents.to(latents_dtype)
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
+
+        self._current_timestep = None
+        if output_type == "latent":
+            image = latents
+        else:
+            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+            latents = latents.to(self.vae.dtype)
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+                latents.device, latents.dtype
+            )
+            latents = latents / latents_std + latents_mean
+            image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+            image = self.image_processor.postprocess(image, output_type=output_type)
+
+        # Offload all models
+        self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (image,)
+
+        return QwenImagePipelineOutput(images=image)
